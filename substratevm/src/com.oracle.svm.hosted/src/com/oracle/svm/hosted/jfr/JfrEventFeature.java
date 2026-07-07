@@ -33,12 +33,14 @@ import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.hub.DynamicHubSupport;
 import com.oracle.svm.core.jfr.JfrFeature;
 import com.oracle.svm.core.jfr.JfrJavaEvents;
+import com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents;
 import com.oracle.svm.core.jfr.traceid.JfrTraceId;
 import com.oracle.svm.core.jfr.traceid.JfrTraceIdMap;
 import com.oracle.svm.core.meta.SharedType;
@@ -100,10 +102,24 @@ public class JfrEventFeature implements InternalFeature {
             for (var newEventClass : JfrJavaEvents.getAllEventClasses()) {
                 Object ec = getConfiguration.invoke(JVM.getJVM(), newEventClass);
                 DynamicHub dynamicHub = accessImpl.getMetaAccess().lookupJavaType(newEventClass).getHub();
+                if (newEventClass == EveryChunkNativePeriodicEvents.class && "libllvmvm".equals(SubstrateOptions.Name.getValue())) {
+                    System.out.println("DEBUG JFR step2: in getAllEventClasses=" + JfrJavaEvents.getAllEventClasses().contains(newEventClass) +
+                                    ", hubConfig=" + (ec != null) + ", classId=" + System.identityHashCode(newEventClass) +
+                                    ", hubId=" + System.identityHashCode(dynamicHub) + ", configId=" + identityHashCodeOrNull(ec));
+                }
                 dynamicHub.setJrfEventConfiguration(ec);
+                if (newEventClass == EveryChunkNativePeriodicEvents.class && "libllvmvm".equals(SubstrateOptions.Name.getValue())) {
+                    Object bakedConfig = dynamicHub.getJfrEventConfiguration();
+                    System.out.println("DEBUG JFR step2b: after setJrfEventConfiguration, hubId=" + System.identityHashCode(dynamicHub) +
+                                    ", bakedConfig=" + (bakedConfig != null) + ", configId=" + identityHashCodeOrNull(bakedConfig));
+                }
             }
         } catch (ReflectiveOperationException ex) {
             throw VMError.shouldNotReachHere(ex);
         }
+    }
+
+    private static String identityHashCodeOrNull(Object value) {
+        return value == null ? "null" : Integer.toString(System.identityHashCode(value));
     }
 }

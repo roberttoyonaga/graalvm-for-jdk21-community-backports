@@ -43,6 +43,7 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.jdk.RuntimeSupport;
 import com.oracle.svm.core.jfr.events.EndChunkNativePeriodicEvents;
 import com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents;
@@ -110,6 +111,12 @@ public class JfrManager {
     }
 
     private static void periodicEventSetup() throws SecurityException {
+        Class<?> eventClass = EveryChunkNativePeriodicEvents.class;
+        DynamicHub hub = DynamicHub.fromClass(eventClass);
+        Object hubConfig = hub.getJfrEventConfiguration();
+        System.out.println("DEBUG JFR step3: hubConfig at runtime=" + (hubConfig != null) +
+                        ", classId=" + System.identityHashCode(eventClass) + ", hubId=" + System.identityHashCode(hub) +
+                        ", configId=" + (hubConfig == null ? "null" : Integer.toString(System.identityHashCode(hubConfig))));
         // The callbacks that are registered below, are invoked regularly to emit periodic native
         // events such as OSInformation or JVMInformation.
         FlightRecorder.addPeriodicEvent(EveryChunkNativePeriodicEvents.class, EveryChunkNativePeriodicEvents::emit);

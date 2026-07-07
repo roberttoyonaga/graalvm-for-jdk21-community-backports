@@ -35,7 +35,9 @@ import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.jfr.JfrJavaEvents;
+import com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.util.ReflectionUtil;
 
@@ -140,6 +142,7 @@ public class JfrEventSubstitution extends SubstitutionProcessor {
     private Boolean initEventClass(ResolvedJavaType eventType) throws RuntimeException {
         try {
             Class<? extends jdk.internal.event.Event> newEventClass = OriginalClassProvider.getJavaClass(eventType).asSubclass(jdk.internal.event.Event.class);
+            // probeEveryChunkNativePeriodicEventsRegistration(newEventClass);
             eventType.initialize();
 
             // It is crucial that mirror events are registered before the actual events.
@@ -154,6 +157,11 @@ public class JfrEventSubstitution extends SubstitutionProcessor {
             // the reflection registration for the event handler field is delayed to the JfrFeature
             // duringAnalysis callback so it does not race/interfere with other retransforms
             JVM.getJVM().retransformClasses(new Class<?>[]{newEventClass});
+            if (newEventClass == EveryChunkNativePeriodicEvents.class && "libllvmvm".equals(SubstrateOptions.Name.getValue())) {
+                // DynamicHub.fromClass() only works at runtime; during analysis Class is not yet a hub.
+                System.out.println("DEBUG JFR step1: initEventClass completed for EveryChunkNativePeriodicEvents, " +
+                                "classId=" + System.identityHashCode(newEventClass) + ", eventTypeId=" + System.identityHashCode(eventType));
+            }
             return Boolean.TRUE;
         } catch (Throwable ex) {
             throw VMError.shouldNotReachHere(ex);
@@ -163,6 +171,20 @@ public class JfrEventSubstitution extends SubstitutionProcessor {
     private boolean needsClassRedefinition(ResolvedJavaType type) {
         return !type.isAbstract() && baseEventType.isAssignableFrom(type) && !baseEventType.equals(type);
     }
+
+    /*
+     * Temporary debug probe: crash during libllvmvm (lli) image build if this event class is
+     * visited by {@link #initEventClass}. Remove after diagnosing JFR registration on pr-313.
+     *
+     * private static void probeEveryChunkNativePeriodicEventsRegistration(Class<?> eventClass) {
+     *     if (eventClass != EveryChunkNativePeriodicEvents.class) {
+     *         return;
+     *     }
+     *     if ("libllvmvm".equals(SubstrateOptions.Name.getValue())) {
+     *         throw VMError.shouldNotReachHere("DEBUG PROBE: JfrEventSubstitution.initEventClass visited EveryChunkNativePeriodicEvents while building libllvmvm (lli)");
+     *     }
+     * }
+     */
 
     /*
      * Mirror events contain the JFR-specific annotations. The mirrored event does not have any
