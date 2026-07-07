@@ -35,7 +35,10 @@ import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 
 import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability;
+import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability.ValueAvailability;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubCompanion;
 import com.oracle.svm.core.hub.DynamicHubSupport;
 import com.oracle.svm.core.jfr.JfrFeature;
 import com.oracle.svm.core.jfr.JfrJavaEvents;
@@ -44,6 +47,7 @@ import com.oracle.svm.core.jfr.traceid.JfrTraceIdMap;
 import com.oracle.svm.core.meta.SharedType;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.util.ReflectionUtil;
 
 import jdk.internal.event.Event;
 import jdk.jfr.internal.JVM;
@@ -74,6 +78,27 @@ public class JfrEventFeature implements InternalFeature {
             RuntimeClassInitialization.initializeAtBuildTime(eventSubClass.getName());
         }
         config.registerSubstitutionProcessor(new JfrEventSubstitution(metaAccess));
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        /*
+         * The value of this field is set later in beforeCompilation, but only when JFR is enabled.
+         * Without a field value transformer, the image heap may snapshot null from analysis and
+         * miss the value set in beforeCompilation (JfrEventSubstitution.initEventClass).
+         * Backported from bbc1f2dbd82.
+         */
+        access.registerFieldValueTransformer(ReflectionUtil.lookupField(DynamicHubCompanion.class, "jfrEventConfiguration"), new FieldValueTransformerWithAvailability() {
+            @Override
+            public ValueAvailability valueAvailability() {
+                return ValueAvailability.AfterAnalysis;
+            }
+
+            @Override
+            public Object transform(Object receiver, Object originalValue) {
+                return originalValue;
+            }
+        });
     }
 
     @Override
