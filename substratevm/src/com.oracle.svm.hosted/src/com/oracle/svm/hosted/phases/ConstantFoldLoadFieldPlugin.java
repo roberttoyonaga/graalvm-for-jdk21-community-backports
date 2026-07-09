@@ -37,6 +37,7 @@ import com.oracle.graal.pointsto.meta.AnalysisMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.svm.core.ParsingReason;
 import com.oracle.svm.core.graal.nodes.LoweredDeadEndNode;
+import com.oracle.svm.hosted.jfr.JfrCompileGraphProbe;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -81,6 +82,7 @@ public final class ConstantFoldLoadFieldPlugin implements NodePlugin {
 
         if (result != null) {
             assert result.asJavaConstant() != null;
+            JfrCompileGraphProbe.logConstantFold(b.getMethod(), field, receiver, result);
             result = b.getGraph().unique(result);
             b.push(field.getJavaKind(), result);
             return true;

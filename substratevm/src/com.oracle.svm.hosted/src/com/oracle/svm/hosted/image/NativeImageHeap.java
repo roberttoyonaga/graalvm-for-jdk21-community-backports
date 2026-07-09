@@ -52,6 +52,8 @@ import org.graalvm.word.UnsignedWord;
 import org.graalvm.word.WordBase;
 
 import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapInstance;
+import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.svm.core.StaticFieldsSupport;
@@ -74,6 +76,7 @@ import com.oracle.svm.core.util.HostedStringDeduplication;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.config.HybridLayout;
+import com.oracle.svm.hosted.jfr.JfrDebugProbe;
 import com.oracle.svm.hosted.meta.HostedArrayClass;
 import com.oracle.svm.hosted.meta.HostedClass;
 import com.oracle.svm.hosted.meta.HostedConstantReflectionProvider;
@@ -84,6 +87,7 @@ import com.oracle.svm.hosted.meta.HostedType;
 import com.oracle.svm.hosted.meta.HostedUniverse;
 import com.oracle.svm.hosted.meta.MaterializedConstantFields;
 import com.oracle.svm.hosted.meta.UniverseBuilder;
+import com.oracle.svm.util.ReflectionUtil;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -501,6 +505,7 @@ public final class NativeImageHeap implements ImageHeap {
             }
 
             info = addToImageHeap(constant, clazz, size, identityHashCode, reason);
+            logEveryChunkCompanionFirstRegistration(clazz, constant, reason);
             try {
                 recursiveAddObject(hub, false, info);
                 // Recursively add all the fields of the object.
@@ -566,7 +571,108 @@ public final class NativeImageHeap implements ImageHeap {
         if (relocatable && !isKnownImmutableConstant(constant)) {
             VMError.shouldNotReachHere("Object with relocatable pointers must be explicitly immutable: " + hUniverse.getSnippetReflection().asObject(Object.class, constant));
         }
-        heapLayouter.assignObjectToPartition(info, !written || immutable, references, relocatable);
+        boolean assignImmutable = !written || immutable;
+        heapLayouter.assignObjectToPartition(info, assignImmutable, references, relocatable);
+        if (type.isInstanceClass()) {
+            logEveryChunkCompanionStep4gb((HostedInstanceClass) type, constant, reason, info, immutableFromParent, immutable, written, references, relocatable, assignImmutable);
+        }
+    }
+
+    private void logEveryChunkCompanionFirstRegistration(HostedInstanceClass clazz, JavaConstant constant, Object reason) {
+        if (!SubstrateOptions.Name.getValue().contains("llvmvm") || JfrDebugProbe.everyChunkCompanionId == 0) {
+            return;
+        }
+        if (clazz.getJavaClass() != DynamicHubCompanion.class) {
+            return;
+        }
+        DynamicHubCompanion companion = hUniverse.getSnippetReflection().asObject(DynamicHubCompanion.class, constant);
+        if (!JfrDebugProbe.isEveryChunkCompanion(companion)) {
+            return;
+        }
+        HostedField jfrField = (HostedField) hMetaAccess.lookupJavaField(ReflectionUtil.lookupField(DynamicHubCompanion.class, "jfrEventConfiguration"));
+        JavaConstant readValue = hConstantReflection.readFieldValue(jfrField, constant);
+        JavaConstant shadowValue = null;
+        boolean backedByHosted = false;
+        if (constant instanceof ImageHeapInstance heapInstance) {
+            backedByHosted = heapInstance.isBackedByHostedObject();
+            shadowValue = heapInstance.readFieldValue((AnalysisField) jfrField.getWrapped());
+        }
+        Object hostedDirect = companion.getJfrEventConfiguration();
+        int readId = (readValue == null || readValue.isNull()) ? 0
+                        : System.identityHashCode(hUniverse.getSnippetReflection().asObject(Object.class, readValue));
+        int shadowId = (shadowValue == null || shadowValue.isNull()) ? 0
+                        : System.identityHashCode(hUniverse.getSnippetReflection().asObject(Object.class, shadowValue));
+        System.err.println("DEBUG JFR step4e image=" + SubstrateOptions.Name.getValue() +
+                        " firstRegistration companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                        " buildConfigId=" + JfrDebugProbe.everyChunkConfigId +
+                        " inclusionReason=" + reason +
+                        " constantKind=" + constant.getClass().getSimpleName() +
+                        " backedByHosted=" + backedByHosted +
+                        " readFieldValueNonNull=" + (readValue != null && !readValue.isNull()) +
+                        " readFieldValueId=" + readId +
+                        " shadowNonNull=" + (shadowValue != null && !shadowValue.isNull()) +
+                        " shadowId=" + shadowId +
+                        " hostedDirectNonNull=" + (hostedDirect != null) +
+                        " hostedDirectId=" + (hostedDirect == null ? 0 : System.identityHashCode(hostedDirect)) +
+                        " isComputedValueField=" + ((AnalysisField) jfrField.getWrapped()).isComputedValue());
+    }
+
+    private void logEveryChunkCompanionStep4gb(HostedInstanceClass clazz, JavaConstant constant, Object reason, ObjectInfo info,
+                    boolean immutableFromParent, boolean immutable, boolean written, boolean references, boolean relocatable, boolean assignImmutable) {
+        if (!SubstrateOptions.Name.getValue().contains("llvmvm") || JfrDebugProbe.everyChunkCompanionId == 0) {
+            return;
+        }
+        if (clazz.getJavaClass() != DynamicHubCompanion.class) {
+            return;
+        }
+        DynamicHubCompanion companion = hUniverse.getSnippetReflection().asObject(DynamicHubCompanion.class, constant);
+        if (!JfrDebugProbe.isEveryChunkCompanion(companion)) {
+            return;
+        }
+        HostedField jfrField = (HostedField) hMetaAccess.lookupJavaField(ReflectionUtil.lookupField(DynamicHubCompanion.class, "jfrEventConfiguration"));
+        AnalysisField jfrAnalysisField = (AnalysisField) jfrField.getWrapped();
+        boolean jfrFieldContributesToWritten = jfrField.isRead() &&
+                        ((jfrField.isWritten() || !jfrField.isValueAvailable()) && !jfrField.isFinal());
+        StringBuilder writtenByFields = new StringBuilder();
+        for (HostedField field : clazz.getInstanceFields(true)) {
+            if (field.isRead() && ((field.isWritten() || !field.isValueAvailable()) && !field.isFinal())) {
+                if (writtenByFields.length() > 0) {
+                    writtenByFields.append(',');
+                }
+                writtenByFields.append(field.getName());
+            }
+        }
+        boolean backedByHosted = false;
+        boolean constantIsImageHeapInstance = constant instanceof ImageHeapInstance;
+        if (constantIsImageHeapInstance) {
+            backedByHosted = ((ImageHeapInstance) constant).isBackedByHostedObject();
+        }
+        ImageHeapPartition partition = info.getPartition();
+        String partitionName = partition == null ? "null" : partition.getName();
+        JfrDebugProbe.everyChunkJfrFieldOffset = jfrField.getLocation();
+        JfrDebugProbe.everyChunkAssignImmutable = assignImmutable;
+        JfrDebugProbe.everyChunkPartitionName = partitionName;
+        System.err.println("DEBUG JFR step4g-b image=" + SubstrateOptions.Name.getValue() +
+                        " companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                        " inclusionReason=" + reason +
+                        " constantKind=" + constant.getClass().getSimpleName() +
+                        " backedByHosted=" + backedByHosted +
+                        " immutableFromParent=" + immutableFromParent +
+                        " immutable=" + immutable +
+                        " written=" + written +
+                        " references=" + references +
+                        " relocatable=" + relocatable +
+                        " assignImmutable=" + assignImmutable +
+                        " partition=" + partitionName +
+                        " jfrFieldOffset=" + jfrField.getLocation() +
+                        " jfrField.isAccessed=" + jfrField.isAccessed() +
+                        " jfrField.isRead=" + jfrField.isRead() +
+                        " jfrField.isWritten=" + jfrField.isWritten() +
+                        " jfrField.isValueAvailable=" + jfrField.isValueAvailable() +
+                        " jfrField.isComputedValue=" + jfrAnalysisField.isComputedValue() +
+                        " jfrFieldContributesToWritten=" + jfrFieldContributesToWritten +
+                        " jfrFieldWouldBeFinalConstant=" + (!jfrField.isWritten() && jfrField.isValueAvailable()) +
+                        " writtenByFields=" + writtenByFields);
     }
 
     private static HostedType requireType(Optional<HostedType> optionalType, Object object, Object reason) {

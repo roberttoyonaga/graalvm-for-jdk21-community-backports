@@ -35,7 +35,10 @@ import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
 
 import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
 import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability;
+import com.oracle.svm.core.fieldvaluetransformer.FieldValueTransformerWithAvailability.ValueAvailability;
 import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubCompanion;
 import com.oracle.svm.core.hub.DynamicHubSupport;
 import com.oracle.svm.core.jfr.JfrFeature;
 import com.oracle.svm.core.jfr.JfrJavaEvents;
@@ -44,9 +47,14 @@ import com.oracle.svm.core.jfr.traceid.JfrTraceIdMap;
 import com.oracle.svm.core.meta.SharedType;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.FeatureImpl;
+import com.oracle.svm.hosted.image.NativeImageHeap;
+import com.oracle.svm.hosted.meta.HostedField;
+import com.oracle.svm.hosted.meta.HostedMetaAccess;
+import com.oracle.svm.util.ReflectionUtil;
 
 import jdk.internal.event.Event;
 import jdk.jfr.internal.JVM;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.MetaAccessProvider;
 
 /**
@@ -76,6 +84,83 @@ public class JfrEventFeature implements InternalFeature {
         config.registerSubstitutionProcessor(new JfrEventSubstitution(metaAccess));
     }
 
+    // PR-313 investigation: toggle to compare Class-hop (disabled) vs direct path (enabled).
+    private static final boolean ENABLE_JFR_FIELD_VALUE_TRANSFORMER = Boolean.parseBoolean(
+                    System.getProperty("jfr.fieldValueTransformer", "false"));
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        if (!ENABLE_JFR_FIELD_VALUE_TRANSFORMER) {
+            return;
+        }
+        access.registerFieldValueTransformer(ReflectionUtil.lookupField(DynamicHubCompanion.class, "jfrEventConfiguration"), new FieldValueTransformerWithAvailability() {
+            @Override
+            public ValueAvailability valueAvailability() {
+                return ValueAvailability.AfterAnalysis;
+            }
+
+            @Override
+            public Object transform(Object receiver, Object originalValue) {
+                return originalValue;
+            }
+        });
+    }
+
+    @Override
+    public void beforeImageWrite(Feature.BeforeImageWriteAccess access) {
+        if (!com.oracle.svm.core.SubstrateOptions.Name.getValue().contains("llvmvm")) {
+            return;
+        }
+        FeatureImpl.BeforeImageWriteAccessImpl impl = (FeatureImpl.BeforeImageWriteAccessImpl) access;
+        HostedMetaAccess meta = impl.getHostedMetaAccess();
+        NativeImageHeap heap = impl.getImage().getHeap();
+
+        DynamicHub hub = meta.lookupJavaType(com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents.class).getHub();
+        Object hostedConfig = hub.getJfrEventConfiguration();
+
+        JavaConstant hubConstant = com.oracle.svm.core.meta.SubstrateObjectConstant.forObject(hub);
+        NativeImageHeap.ObjectInfo hubInfo = heap.getConstantInfo(hubConstant);
+
+        HostedField companionField = (HostedField) meta.lookupJavaField(ReflectionUtil.lookupField(DynamicHub.class, "companion"));
+        JavaConstant companionConstant = heap.hConstantReflection.readFieldValue(companionField, hubInfo.getConstant());
+
+        HostedField jfrField = (HostedField) meta.lookupJavaField(ReflectionUtil.lookupField(DynamicHubCompanion.class, "jfrEventConfiguration"));
+        JavaConstant heapReadConfig = heap.hConstantReflection.readFieldValue(jfrField, companionConstant);
+
+        JavaConstant shadowConfig = null;
+        if (companionConstant instanceof com.oracle.graal.pointsto.heap.ImageHeapInstance ihi) {
+            shadowConfig = ihi.readFieldValue((com.oracle.graal.pointsto.meta.AnalysisField) jfrField.getWrapped());
+        }
+
+        System.err.println("DEBUG JFR step4b image=" + com.oracle.svm.core.SubstrateOptions.Name.getValue() +
+                        " hubId=" + JfrDebugProbe.everyChunkHubId +
+                        " companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                        " buildConfigId=" + JfrDebugProbe.everyChunkConfigId +
+                        " hostedConfigNonNull=" + (hostedConfig != null) +
+                        " hostedConfigId=" + (hostedConfig == null ? 0 : System.identityHashCode(hostedConfig)) +
+                        " heapReadConfigNonNull=" + (heapReadConfig != null && !heapReadConfig.isNull()) +
+                        " heapReadConfigId=" + (heapReadConfig == null || heapReadConfig.isNull() ? 0
+                                        : System.identityHashCode(heap.hUniverse.getSnippetReflection().asObject(Object.class, heapReadConfig))) +
+                        " shadowConfigNonNull=" + (shadowConfig != null && !shadowConfig.isNull()) +
+                        " hubConstantKind=" + hubInfo.getConstant().getClass().getSimpleName() +
+                        " companionConstantKind=" + companionConstant.getClass().getSimpleName() +
+                        " hubInclusionReason=" + hubInfo);
+
+        NativeImageHeap.ObjectInfo companionInfo = companionConstant.isNull() ? null : heap.getConstantInfo(companionConstant);
+        System.err.println("DEBUG JFR step4g-build image=" + com.oracle.svm.core.SubstrateOptions.Name.getValue() +
+                        " hubHeapAddress=" + hubInfo.getAddress() +
+                        " companionHeapAddress=" + (companionInfo == null ? 0 : companionInfo.getAddress()) +
+                        " hubPointsToCompanionAddress=" + JfrDebugProbe.everyChunkHubPointsToCompanionAddress +
+                        " configHeapAddress=" + JfrDebugProbe.everyChunkConfigHeapAddress +
+                        " jfrFieldBufferIndex=" + JfrDebugProbe.everyChunkJfrFieldBufferIndex +
+                        " jfrFieldOffset=" + JfrDebugProbe.everyChunkJfrFieldOffset +
+                        " partition=" + JfrDebugProbe.everyChunkPartitionName +
+                        " assignImmutable=" + JfrDebugProbe.everyChunkAssignImmutable +
+                        " rawAfterFieldWrite=" + JfrDebugProbe.everyChunkJfrFieldRawAfterWrite +
+                        " rawAfterFullHeapWrite=" + JfrDebugProbe.everyChunkJfrFieldRawAfterFullHeapWrite +
+                        " hubCompanionAddrsMatch=" + (companionInfo != null && companionInfo.getAddress() == JfrDebugProbe.everyChunkHubPointsToCompanionAddress));
+    }
+
     @Override
     public void beforeCompilation(BeforeCompilationAccess a) {
         // Reserve slot 0 for error-catcher.
@@ -101,6 +186,13 @@ public class JfrEventFeature implements InternalFeature {
                 Object ec = getConfiguration.invoke(JVM.getJVM(), newEventClass);
                 DynamicHub dynamicHub = accessImpl.getMetaAccess().lookupJavaType(newEventClass).getHub();
                 dynamicHub.setJrfEventConfiguration(ec);
+                if (newEventClass == com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents.class) {
+                    JfrDebugProbe.recordEveryChunk(dynamicHub, ec);
+                    System.err.println("DEBUG JFR step2b image=" + com.oracle.svm.core.SubstrateOptions.Name.getValue() +
+                                    " hubId=" + JfrDebugProbe.everyChunkHubId +
+                                    " companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                                    " configId=" + JfrDebugProbe.everyChunkConfigId);
+                }
             }
         } catch (ReflectiveOperationException ex) {
             throw VMError.shouldNotReachHere(ex);

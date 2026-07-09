@@ -131,6 +131,7 @@ import com.oracle.svm.hosted.NativeImageGenerator;
 import com.oracle.svm.hosted.NativeImageOptions;
 import com.oracle.svm.hosted.ProgressReporter;
 import com.oracle.svm.hosted.diagnostic.HostedHeapDumpFeature;
+import com.oracle.svm.hosted.jfr.JfrCompileGraphProbe;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedUniverse;
 import com.oracle.svm.hosted.phases.DevirtualizeCallsPhase;
@@ -1114,6 +1115,8 @@ public class CompileQueue {
 
     @SuppressWarnings("unused")
     protected void beforeEncode(HostedMethod method, StructuredGraph graph) {
+        JfrCompileGraphProbe.inspectGraphBeforeEncode(method, graph);
+        JfrCompileGraphProbe.inspectGetJfrEventConfigurationGraph(method, graph);
     }
 
     protected OptionValues getCustomizedOptions(@SuppressWarnings("unused") HostedMethod method, DebugContext debug) {

@@ -43,6 +43,8 @@ import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.DynamicHubCompanion;
 import com.oracle.svm.core.jdk.RuntimeSupport;
 import com.oracle.svm.core.jfr.events.EndChunkNativePeriodicEvents;
 import com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents;
@@ -110,6 +112,29 @@ public class JfrManager {
     }
 
     private static void periodicEventSetup() throws SecurityException {
+        if (SubstrateOptions.Name.getValue().contains("llvmvm")) {
+            DynamicHub hub = DynamicHub.fromClass(EveryChunkNativePeriodicEvents.class);
+            DynamicHubCompanion companion = hub.getCompanion();
+            Object cfg = hub.getJfrEventConfiguration();
+            Object companionCfg = companion.getJfrEventConfiguration();
+            int configId = cfg == null ? 0 : System.identityHashCode(cfg);
+            int companionConfigId = companionCfg == null ? 0 : System.identityHashCode(companionCfg);
+            Object companionViaHubField = hub.getCompanion();
+            Object cfgViaCompanionField = companion.getJfrEventConfiguration();
+            System.err.println("DEBUG JFR step3 image=" + SubstrateOptions.Name.getValue() +
+                            " hubId=" + System.identityHashCode(hub) +
+                            " companionId=" + System.identityHashCode(companion) +
+                            " hubConfigNonNull=" + (cfg != null) +
+                            " hubConfigId=" + configId +
+                            " companionConfigNonNull=" + (companionCfg != null) +
+                            " companionConfigId=" + companionConfigId);
+            System.err.println("DEBUG JFR step4g-runtime image=" + SubstrateOptions.Name.getValue() +
+                            " hubCompanionSameRef=" + (companionViaHubField == companion) +
+                            " companionViaGetterId=" + System.identityHashCode(companionViaHubField) +
+                            " cfgViaGetterNonNull=" + (cfgViaCompanionField != null) +
+                            " cfgViaGetterId=" + (cfgViaCompanionField == null ? 0 : System.identityHashCode(cfgViaCompanionField)) +
+                            " hubGetterMatchesCompanionGetter=" + (cfg == cfgViaCompanionField));
+        }
         // The callbacks that are registered below, are invoked regularly to emit periodic native
         // events such as OSInformation or JVMInformation.
         FlightRecorder.addPeriodicEvent(EveryChunkNativePeriodicEvents.class, EveryChunkNativePeriodicEvents::emit);

@@ -30,6 +30,7 @@ import static com.oracle.svm.core.util.VMError.shouldNotReachHereUnexpectedInput
 import java.lang.reflect.Array;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
+import java.util.Map;
 
 import com.oracle.svm.core.meta.SubstrateMethodPointerConstant;
 import jdk.vm.ci.meta.Constant;
@@ -52,10 +53,14 @@ import com.oracle.svm.core.FrameAccess;
 import com.oracle.svm.core.StaticFieldsSupport;
 import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.config.ObjectLayout;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.hub.DynamicHubCompanion;
+import com.oracle.svm.hosted.jfr.JfrDebugProbe;
 import com.oracle.svm.core.heap.Heap;
 import com.oracle.svm.core.heap.ObjectHeader;
 import com.oracle.svm.core.hub.DynamicHub;
 import com.oracle.svm.core.image.ImageHeapLayoutInfo;
+import com.oracle.svm.core.image.ImageHeapPartition;
 import com.oracle.svm.core.meta.MethodPointer;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.hosted.config.HybridLayout;
@@ -101,6 +106,7 @@ public final class NativeImageHeapWriter {
             writeStaticFields(buffer);
 
             heap.getLayouter().writeMetadata(buffer.getByteBuffer(), 0);
+            logStep4gFinalBufferReadback(buffer);
         }
         return sectionOffsetOfARelocatablePointer;
     }
@@ -150,11 +156,155 @@ public final class NativeImageHeapWriter {
             throw NativeImageHeap.reportIllegalType(ex.getType(), info);
         }
 
+        boolean logEveryChunkJfrField = field.getName().equals("jfrEventConfiguration") && info != null &&
+                        info.getClazz().getJavaClass() == DynamicHubCompanion.class &&
+                        SubstrateOptions.Name.getValue().contains("llvmvm") && JfrDebugProbe.isEveryChunkCompanion(info.getObject());
+        Object configObj = null;
+        int writtenConfigId = 0;
+        NativeImageHeap.ObjectInfo configInfo = null;
+        if (logEveryChunkJfrField) {
+            configObj = (value == null || value.isNull()) ? null : snippetReflection().asObject(Object.class, value);
+            writtenConfigId = configObj == null ? 0 : System.identityHashCode(configObj);
+            configInfo = (configObj == null) ? null : heap.getConstantInfo(value);
+            System.err.println("DEBUG JFR step4d image=" + SubstrateOptions.Name.getValue() +
+                            " companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                            " buildConfigId=" + JfrDebugProbe.everyChunkConfigId +
+                            " writtenConfigId=" + writtenConfigId +
+                            " configMatchesBuild=" + (writtenConfigId == JfrDebugProbe.everyChunkConfigId) +
+                            " configInHeap=" + (configInfo != null) +
+                            " bufferIndex=" + index +
+                            " fieldOffset=" + field.getLocation() +
+                            " receiverKind=" + (receiver == null ? "null" : receiver.getClass().getSimpleName()) +
+                            " objectInfo=" + info);
+        }
+
+        if (field.getName().equals("jfrEventConfiguration") && info != null && info.getClazz().getJavaClass() == DynamicHubCompanion.class
+                        && SubstrateOptions.Name.getValue().contains("llvmvm") && !JfrDebugProbe.isEveryChunkCompanion(info.getObject())) {
+            System.err.println("DEBUG JFR step4c image=" + SubstrateOptions.Name.getValue() +
+                            " writing companionObject=" + System.identityHashCode(info.getObject()) +
+                            " receiverKind=" + (receiver == null ? "null" : receiver.getClass().getSimpleName()) +
+                            " valueNonNull=" + (value != null && !value.isNull()) +
+                            " objectInfo=" + info);
+        }
+
         if (value.getJavaKind() == JavaKind.Object && heap.hMetaAccess.isInstanceOf(value, RelocatedPointer.class)) {
             addNonDataRelocation(buffer, index, snippetReflection().asObject(RelocatedPointer.class, value));
         } else {
             write(buffer, index, value, info != null ? info : field);
         }
+
+        if (logEveryChunkJfrField && value != null && !value.isNull() && value.getJavaKind() == JavaKind.Object) {
+            logStep4fReadback(buffer, index, configInfo, writtenConfigId, info);
+        }
+    }
+
+    private void logStep4fReadback(RelocatableBuffer buffer, int index, ObjectInfo configInfo, int writtenConfigId, ObjectInfo companionInfo) {
+        long rawInBuffer = referenceSize() == Long.BYTES ? buffer.getByteBuffer().getLong(index) : buffer.getByteBuffer().getInt(index) & 0xFFFF_FFFFL;
+        long expectedAddress = configInfo != null ? configInfo.getAddress() : 0;
+        long expectedInBuffer = expectedAddress;
+        if (useHeapBase) {
+            expectedInBuffer = expectedAddress >>> compressEncoding.getShift();
+        }
+        RelocatableBuffer.Info relocation = findRelocation(buffer, index);
+        boolean relocationPresent = relocation != null;
+        int relocationTargetId = 0;
+        boolean relocationPointsToWrittenConfig = false;
+        if (relocation != null) {
+            Object target = relocation.getTargetObject();
+            if (target instanceof SubstrateObjectConstant soc) {
+                Object targetObj = snippetReflection().asObject(Object.class, soc);
+                relocationTargetId = System.identityHashCode(targetObj);
+                relocationPointsToWrittenConfig = writtenConfigId != 0 && relocationTargetId == writtenConfigId;
+            } else if (target instanceof JavaConstant jc && !jc.isNull()) {
+                Object targetObj = snippetReflection().asObject(Object.class, jc);
+                relocationTargetId = System.identityHashCode(targetObj);
+                relocationPointsToWrittenConfig = writtenConfigId != 0 && relocationTargetId == writtenConfigId;
+            } else if (target instanceof ImageHeapConstant ihc && ihc.getHostedObject() != null) {
+                Object targetObj = snippetReflection().asObject(Object.class, ihc.getHostedObject());
+                relocationTargetId = System.identityHashCode(targetObj);
+                relocationPointsToWrittenConfig = writtenConfigId != 0 && relocationTargetId == writtenConfigId;
+            }
+        }
+        boolean rawMatchesExpected = useHeapBase && rawInBuffer == expectedInBuffer;
+        if (configInfo != null && companionInfo != null) {
+            JfrDebugProbe.everyChunkCompanionHeapAddress = companionInfo.getAddress();
+            JfrDebugProbe.everyChunkConfigHeapAddress = expectedAddress;
+            JfrDebugProbe.everyChunkJfrFieldBufferIndex = index;
+            JfrDebugProbe.everyChunkJfrFieldRawAfterWrite = rawInBuffer;
+        }
+        logHubCompanionWiring(writtenConfigId);
+        System.err.println("DEBUG JFR step4f image=" + SubstrateOptions.Name.getValue() +
+                        " bufferIndex=" + index +
+                        " useHeapBase=" + useHeapBase +
+                        " rawInBuffer=" + rawInBuffer +
+                        " expectedHeapAddress=" + expectedAddress +
+                        " expectedInBuffer=" + expectedInBuffer +
+                        " rawMatchesExpected=" + rawMatchesExpected +
+                        " relocationPresent=" + relocationPresent +
+                        " relocationTargetId=" + relocationTargetId +
+                        " relocationPointsToWrittenConfig=" + relocationPointsToWrittenConfig +
+                        " writtenConfigId=" + writtenConfigId);
+    }
+
+    private static RelocatableBuffer.Info findRelocation(RelocatableBuffer buffer, int index) {
+        for (Map.Entry<Integer, RelocatableBuffer.Info> entry : buffer.getSortedRelocations()) {
+            if (entry.getKey() == index) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private void logHubCompanionWiring(int writtenConfigId) {
+        if (JfrDebugProbe.everyChunkHubId == 0) {
+            return;
+        }
+        try {
+            DynamicHub hub = heap.hMetaAccess.lookupJavaType(com.oracle.svm.core.jfr.events.EveryChunkNativePeriodicEvents.class).getHub();
+            if (!JfrDebugProbe.isEveryChunkHub(hub)) {
+                return;
+            }
+            JavaConstant hubConstant = SubstrateObjectConstant.forObject(hub);
+            ObjectInfo hubInfo = heap.getConstantInfo(hubConstant);
+            if (hubInfo == null) {
+                return;
+            }
+            JfrDebugProbe.everyChunkHubHeapAddress = hubInfo.getAddress();
+            HostedField companionField = (HostedField) heap.hMetaAccess.lookupJavaField(
+                            com.oracle.svm.util.ReflectionUtil.lookupField(DynamicHub.class, "companion"));
+            JavaConstant companionFromHub = heap.hConstantReflection.readFieldValue(companionField, hubInfo.getConstant());
+            ObjectInfo companionFromHubInfo = companionFromHub.isNull() ? null : heap.getConstantInfo(companionFromHub);
+            JfrDebugProbe.everyChunkHubPointsToCompanionAddress = companionFromHubInfo == null ? 0 : companionFromHubInfo.getAddress();
+            System.err.println("DEBUG JFR step4g-wiring image=" + SubstrateOptions.Name.getValue() +
+                            " hubHeapAddress=" + hubInfo.getAddress() +
+                            " companionHeapAddress=" + JfrDebugProbe.everyChunkCompanionHeapAddress +
+                            " hubPointsToCompanionAddress=" + JfrDebugProbe.everyChunkHubPointsToCompanionAddress +
+                            " hubCompanionAddrsMatch=" + (JfrDebugProbe.everyChunkCompanionHeapAddress == JfrDebugProbe.everyChunkHubPointsToCompanionAddress) +
+                            " configHeapAddress=" + JfrDebugProbe.everyChunkConfigHeapAddress +
+                            " writtenConfigId=" + writtenConfigId);
+        } catch (Throwable t) {
+            System.err.println("DEBUG JFR step4g-wiring image=" + SubstrateOptions.Name.getValue() + " error=" + t);
+        }
+    }
+
+    private void logStep4gFinalBufferReadback(RelocatableBuffer buffer) {
+        if (JfrDebugProbe.everyChunkJfrFieldBufferIndex == 0) {
+            return;
+        }
+        int index = JfrDebugProbe.everyChunkJfrFieldBufferIndex;
+        long rawInBuffer = referenceSize() == Long.BYTES ? buffer.getByteBuffer().getLong(index) : buffer.getByteBuffer().getInt(index) & 0xFFFF_FFFFL;
+        JfrDebugProbe.everyChunkJfrFieldRawAfterFullHeapWrite = rawInBuffer;
+        long expectedInBuffer = JfrDebugProbe.everyChunkConfigHeapAddress;
+        if (useHeapBase) {
+            expectedInBuffer = JfrDebugProbe.everyChunkConfigHeapAddress >>> compressEncoding.getShift();
+        }
+        System.err.println("DEBUG JFR step4g-final image=" + SubstrateOptions.Name.getValue() +
+                        " bufferIndex=" + index +
+                        " rawAfterFullHeapWrite=" + rawInBuffer +
+                        " rawAfterFieldWrite=" + JfrDebugProbe.everyChunkJfrFieldRawAfterWrite +
+                        " expectedInBuffer=" + expectedInBuffer +
+                        " stillMatches=" + (rawInBuffer == expectedInBuffer) +
+                        " overwrittenSinceStep4f=" + (rawInBuffer != JfrDebugProbe.everyChunkJfrFieldRawAfterWrite));
     }
 
     private void write(RelocatableBuffer buffer, int index, JavaConstant con, Object reason) {
@@ -319,6 +469,16 @@ public final class NativeImageHeapWriter {
     }
 
     private void writeObject(ObjectInfo info, RelocatableBuffer buffer) {
+        if (SubstrateOptions.Name.getValue().contains("llvmvm") && JfrDebugProbe.everyChunkCompanionId != 0 &&
+                        info.getClazz().getJavaClass() == com.oracle.svm.core.hub.DynamicHubCompanion.class &&
+                        JfrDebugProbe.isEveryChunkCompanion(info.getObject())) {
+            ImageHeapPartition partition = info.getPartition();
+            System.err.println("DEBUG JFR step4g-b-write image=" + SubstrateOptions.Name.getValue() +
+                            " companionId=" + JfrDebugProbe.everyChunkCompanionId +
+                            " heapAddress=" + info.getAddress() +
+                            " partition=" + (partition == null ? "null" : partition.getName()) +
+                            " assignImmutable=" + JfrDebugProbe.everyChunkAssignImmutable);
+        }
         /*
          * Write a reference from the object to its hub. This lives at layout.getHubOffset() from
          * the object base.

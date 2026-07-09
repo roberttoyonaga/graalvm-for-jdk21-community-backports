@@ -25,6 +25,7 @@
 package com.oracle.svm.hosted.ameta;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Set;
 import java.util.function.ObjIntConsumer;
 
@@ -42,7 +43,9 @@ import com.oracle.graal.pointsto.infrastructure.UniverseMetaAccess;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.AnalysisUniverse;
+import com.oracle.svm.core.BuildPhaseProvider;
 import com.oracle.svm.core.RuntimeAssertionsSupport;
+import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.graal.meta.SharedConstantReflectionProvider;
 import com.oracle.svm.core.hub.DynamicHub;
@@ -196,6 +199,7 @@ public class AnalysisConstantReflectionProvider extends SharedConstantReflection
         }
 
         JavaConstant value = null;
+        boolean usedShadowPath = false;
         if (returnSimulatedValues) {
             value = readSimulatedValue(field);
         }
@@ -210,13 +214,32 @@ public class AnalysisConstantReflectionProvider extends SharedConstantReflection
                  */
                 receiver = heapObject.getHostedObject();
             } else {
+                usedShadowPath = true;
                 value = heapObject.readFieldValue(field);
             }
         }
         if (value == null) {
             value = universe.lookup(ReadableJavaField.readFieldValue(suppliedMetaAccess, classInitializationSupport, field.wrapped, universe.toHosted(receiver)));
         }
+        if (BuildPhaseProvider.isCompilationFinished() && "jfrEventConfiguration".equals(field.getName()) && SubstrateOptions.Name.getValue().contains("llvmvm")) {
+            logJfrEventConfigurationRead(r, usedShadowPath, value);
+        }
         return interceptValue(suppliedMetaAccess, field, value);
+    }
+
+    private static final AtomicBoolean jfrStep4Logged = new AtomicBoolean();
+
+    private static void logJfrEventConfigurationRead(JavaConstant receiver, boolean usedShadowPath, JavaConstant result) {
+        if (!jfrStep4Logged.compareAndSet(false, true)) {
+            return;
+        }
+        String receiverKind = receiver == null ? "null" : receiver.getClass().getSimpleName();
+        boolean backedByHosted = receiver instanceof ImageHeapInstance ihi && ihi.isBackedByHostedObject();
+        System.err.println("DEBUG JFR step4 image=" + SubstrateOptions.Name.getValue() +
+                        " receiverKind=" + receiverKind +
+                        " backedByHosted=" + backedByHosted +
+                        " usedShadowPath=" + usedShadowPath +
+                        " resultNonNull=" + (result != null && !result.isNull()));
     }
 
     /** Read the field value and wrap it in a value supplier without performing any replacements. */
